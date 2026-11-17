@@ -1,0 +1,4 @@
+comment = 'Effect Schema and nullability for a query, from the Postgres analyzer'
+default_version = '1.0'
+module_pathname = '$libdir/query_schema'
+relocatable = true

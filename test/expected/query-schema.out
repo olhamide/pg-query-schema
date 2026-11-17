@@ -1,0 +1,213 @@
+CREATE EXTENSION query_schema;
+CREATE TYPE listing_status AS ENUM ('draft', 'active', 'sold');
+CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL, bio text, created_at timestamptz NOT NULL);
+CREATE TABLE listings (
+  id int PRIMARY KEY,
+  seller_id int NOT NULL REFERENCES users,
+  title text NOT NULL,
+  price_kobo bigint NOT NULL,
+  status listing_status NOT NULL,
+  tags text[] NOT NULL,
+  rating numeric,
+  sold_at timestamptz,
+  published_on date
+);
+CREATE TABLE photos (id int PRIMARY KEY, listing_id int NOT NULL REFERENCES listings, url text NOT NULL);
+SELECT * FROM query_shape($$
+  SELECT u.id, u.email, u.bio, l.title, p.url
+  FROM users u
+  LEFT JOIN listings l ON l.seller_id = u.id
+  LEFT JOIN photos p ON p.listing_id = l.id
+$$);
+ path  | pg_type | nullable |            schema            | note 
+-------+---------+----------+------------------------------+------
+ id    | integer | f        | Schema.Number                | 
+ email | text    | f        | Schema.String                | 
+ bio   | text    | t        | Schema.NullOr(Schema.String) | 
+ title | text    | t        | Schema.NullOr(Schema.String) | 
+ url   | text    | t        | Schema.NullOr(Schema.String) | 
+(5 rows)
+
+SELECT * FROM query_shape($$
+  SELECT l.title, u.email FROM listings l RIGHT JOIN users u ON u.id = l.seller_id
+$$);
+ path  | pg_type | nullable |            schema            | note 
+-------+---------+----------+------------------------------+------
+ title | text    | t        | Schema.NullOr(Schema.String) | 
+ email | text    | f        | Schema.String                | 
+(2 rows)
+
+SELECT * FROM query_shape($$
+  SELECT u.email, l.title FROM users u LEFT JOIN listings l ON l.seller_id = u.id WHERE l.id IS NOT NULL
+$$);
+ path  | pg_type | nullable |    schema     | note 
+-------+---------+----------+---------------+------
+ email | text    | f        | Schema.String | 
+ title | text    | f        | Schema.String | 
+(2 rows)
+
+SELECT * FROM query_shape($$
+  SELECT u.id, u.email,
+    count(l.id) AS listing_count,
+    max(l.price_kobo) AS top_price,
+    coalesce(json_agg(json_build_object(
+      'id', l.id,
+      'title', l.title,
+      'priceKobo', l.price_kobo,
+      'priceKoboText', l.price_kobo::text,
+      'status', l.status,
+      'tags', l.tags,
+      'rating', l.rating,
+      'soldAt', l.sold_at,
+      'publishedOn', l.published_on,
+      'photos', coalesce((SELECT json_agg(json_build_object('url', p.url)) FROM photos p WHERE p.listing_id = l.id), '[]')
+    ) ORDER BY l.id) FILTER (WHERE l.id IS NOT NULL), '[]') AS listings
+  FROM users u
+  LEFT JOIN listings l ON l.seller_id = u.id
+  GROUP BY u.id, u.email
+$$);
+           path           |             pg_type              | nullable |                                                                                                                                                                                                                     schema                                                                                                                                                                                                                     |                      note                      
+--------------------------+----------------------------------+----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------------------------------------------
+ id                       | integer                          | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                                                                                                                  | 
+ email                    | text                             | f        | Schema.String                                                                                                                                                                                                                                                                                                                                                                                                                                  | 
+ listing_count            | bigint                           | f        | Schema.BigInt                                                                                                                                                                                                                                                                                                                                                                                                                                  | 
+ top_price                | bigint                           | t        | Schema.NullOr(Schema.BigInt)                                                                                                                                                                                                                                                                                                                                                                                                                   | 
+ listings                 | json array                       | f        | Schema.Array(Schema.Struct({ id: Schema.Number, title: Schema.String, priceKobo: Schema.Number, priceKoboText: Schema.BigIntFromString, status: Schema.Literals(["draft", "active", "sold"]), tags: Schema.Array(Schema.NullOr(Schema.String)), rating: Schema.NullOr(Schema.Number), soldAt: Schema.NullOr(Schema.DateFromString), publishedOn: Schema.NullOr(Schema.String), photos: Schema.Array(Schema.Struct({ url: Schema.String })) })) | 
+ listings[]               | json object                      | f        | Schema.Struct({ id: Schema.Number, title: Schema.String, priceKobo: Schema.Number, priceKoboText: Schema.BigIntFromString, status: Schema.Literals(["draft", "active", "sold"]), tags: Schema.Array(Schema.NullOr(Schema.String)), rating: Schema.NullOr(Schema.Number), soldAt: Schema.NullOr(Schema.DateFromString), publishedOn: Schema.NullOr(Schema.String), photos: Schema.Array(Schema.Struct({ url: Schema.String })) })               | 
+ listings[].id            | integer in json                  | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                                                                                                                  | 
+ listings[].title         | text in json                     | f        | Schema.String                                                                                                                                                                                                                                                                                                                                                                                                                                  | 
+ listings[].priceKobo     | bigint in json                   | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                                                                                                                  | JSON number can lose precision, cast to ::text
+ listings[].priceKoboText | text in json                     | f        | Schema.BigIntFromString                                                                                                                                                                                                                                                                                                                                                                                                                        | 
+ listings[].status        | listing_status in json           | f        | Schema.Literals(["draft", "active", "sold"])                                                                                                                                                                                                                                                                                                                                                                                                   | 
+ listings[].tags          | json array                       | f        | Schema.Array(Schema.NullOr(Schema.String))                                                                                                                                                                                                                                                                                                                                                                                                     | 
+ listings[].tags[]        | text in json                     | t        | Schema.NullOr(Schema.String)                                                                                                                                                                                                                                                                                                                                                                                                                   | nullability unknown, assumed nullable
+ listings[].rating        | numeric in json                  | t        | Schema.NullOr(Schema.Number)                                                                                                                                                                                                                                                                                                                                                                                                                   | JSON number can lose precision, cast to ::text
+ listings[].soldAt        | timestamp with time zone in json | t        | Schema.NullOr(Schema.DateFromString)                                                                                                                                                                                                                                                                                                                                                                                                           | 
+ listings[].publishedOn   | date in json                     | t        | Schema.NullOr(Schema.String)                                                                                                                                                                                                                                                                                                                                                                                                                   | 
+ listings[].photos        | json array                       | f        | Schema.Array(Schema.Struct({ url: Schema.String }))                                                                                                                                                                                                                                                                                                                                                                                            | 
+ listings[].photos[]      | json object                      | f        | Schema.Struct({ url: Schema.String })                                                                                                                                                                                                                                                                                                                                                                                                          | 
+ listings[].photos[].url  | text in json                     | f        | Schema.String                                                                                                                                                                                                                                                                                                                                                                                                                                  | 
+(19 rows)
+
+SELECT query_schema($$
+  SELECT u.id, u.created_at,
+    coalesce(json_agg(json_build_object('title', l.title, 'soldAt', l.sold_at)) FILTER (WHERE l.id IS NOT NULL), '[]') AS listings
+  FROM users u LEFT JOIN listings l ON l.seller_id = u.id
+  GROUP BY u.id
+$$);
+                   query_schema                    
+---------------------------------------------------
+ Schema.Struct({                                  +
+   id: Schema.Number,                             +
+   created_at: Schema.Date,                       +
+   listings: Schema.Array(Schema.Struct({         +
+     title: Schema.String,                        +
+     soldAt: Schema.NullOr(Schema.DateFromString),+
+   })),                                           +
+ })
+(1 row)
+
+SELECT * FROM query_shape($$
+  SELECT json_agg(json_build_object('id', l.id)) AS naive FROM users u LEFT JOIN listings l ON l.seller_id = u.id
+$$);
+    path    |     pg_type     | nullable |                                      schema                                      | note 
+------------+-----------------+----------+----------------------------------------------------------------------------------+------
+ naive      | json array      | t        | Schema.NullOr(Schema.Array(Schema.Struct({ id: Schema.NullOr(Schema.Number) }))) | 
+ naive[]    | json object     | f        | Schema.Struct({ id: Schema.NullOr(Schema.Number) })                              | 
+ naive[].id | integer in json | t        | Schema.NullOr(Schema.Number)                                                     | 
+(3 rows)
+
+SELECT * FROM query_shape($$
+  WITH sellers AS (SELECT id, email FROM users)
+  SELECT s.id, s.email, (SELECT count(*) FROM listings) AS total, (SELECT title FROM listings LIMIT 1) AS any_title
+  FROM sellers s
+$$);
+   path    | pg_type | nullable |            schema            | note 
+-----------+---------+----------+------------------------------+------
+ id        | integer | f        | Schema.Number                | 
+ email     | text    | f        | Schema.String                | 
+ total     | bigint  | f        | Schema.BigInt                | 
+ any_title | text    | t        | Schema.NullOr(Schema.String) | 
+(4 rows)
+
+SELECT * FROM query_shape($$
+  SELECT row_to_json(l) AS listing, to_json(u.created_at) AS created, json_agg(p) AS photos
+  FROM listings l JOIN users u ON u.id = l.seller_id LEFT JOIN photos p ON p.listing_id = l.id
+  GROUP BY l.id, u.created_at
+$$);
+         path         |             pg_type              | nullable |                                                                                                                                                                          schema                                                                                                                                                                          |                      note                      
+----------------------+----------------------------------+----------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------------------------------------------
+ listing              | json object                      | f        | Schema.Struct({ id: Schema.Number, seller_id: Schema.Number, title: Schema.String, price_kobo: Schema.Number, status: Schema.Literals(["draft", "active", "sold"]), tags: Schema.Array(Schema.NullOr(Schema.String)), rating: Schema.NullOr(Schema.Number), sold_at: Schema.NullOr(Schema.DateFromString), published_on: Schema.NullOr(Schema.String) }) | 
+ listing.id           | integer in json                  | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                            | 
+ listing.seller_id    | integer in json                  | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                            | 
+ listing.title        | text in json                     | f        | Schema.String                                                                                                                                                                                                                                                                                                                                            | 
+ listing.price_kobo   | bigint in json                   | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                            | JSON number can lose precision, cast to ::text
+ listing.status       | listing_status in json           | f        | Schema.Literals(["draft", "active", "sold"])                                                                                                                                                                                                                                                                                                             | 
+ listing.tags         | json array                       | f        | Schema.Array(Schema.NullOr(Schema.String))                                                                                                                                                                                                                                                                                                               | 
+ listing.tags[]       | text in json                     | t        | Schema.NullOr(Schema.String)                                                                                                                                                                                                                                                                                                                             | nullability unknown, assumed nullable
+ listing.rating       | numeric in json                  | t        | Schema.NullOr(Schema.Number)                                                                                                                                                                                                                                                                                                                             | JSON number can lose precision, cast to ::text
+ listing.sold_at      | timestamp with time zone in json | t        | Schema.NullOr(Schema.DateFromString)                                                                                                                                                                                                                                                                                                                     | 
+ listing.published_on | date in json                     | t        | Schema.NullOr(Schema.String)                                                                                                                                                                                                                                                                                                                             | 
+ created              | timestamp with time zone in json | f        | Schema.DateFromString                                                                                                                                                                                                                                                                                                                                    | 
+ photos               | json array                       | f        | Schema.Array(Schema.NullOr(Schema.Struct({ id: Schema.Number, listing_id: Schema.Number, url: Schema.String })))                                                                                                                                                                                                                                         | 
+ photos[]             | json object                      | t        | Schema.NullOr(Schema.Struct({ id: Schema.Number, listing_id: Schema.Number, url: Schema.String }))                                                                                                                                                                                                                                                       | 
+ photos[].id          | integer in json                  | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                            | 
+ photos[].listing_id  | integer in json                  | f        | Schema.Number                                                                                                                                                                                                                                                                                                                                            | 
+ photos[].url         | text in json                     | f        | Schema.String                                                                                                                                                                                                                                                                                                                                            | 
+(17 rows)
+
+SELECT * FROM query_shape($$
+  SELECT lower(u.email) AS email, coalesce(u.bio, '') AS bio, u.bio || '!' AS shout, now() AS at,
+    CASE WHEN u.bio IS NULL THEN 'none' ELSE 'some' END AS kind, u.created_at::date AS day,
+    l.status, l.rating, l.tags, l.published_on
+  FROM users u JOIN listings l ON l.seller_id = u.id
+  WHERE u.id = $1 AND l.status = $2
+$$);
+     path     |         pg_type          | nullable |                    schema                    |                  note                  
+--------------+--------------------------+----------+----------------------------------------------+----------------------------------------
+ $1           | integer                  |          | Schema.Number                                | 
+ $2           | listing_status           |          | Schema.Literals(["draft", "active", "sold"]) | 
+ email        | text                     | f        | Schema.String                                | 
+ bio          | text                     | f        | Schema.String                                | 
+ shout        | text                     | t        | Schema.NullOr(Schema.String)                 | 
+ at           | timestamp with time zone | f        | Schema.Date                                  | 
+ kind         | text                     | f        | Schema.String                                | 
+ day          | date                     | f        | Schema.String                                | 
+ status       | listing_status           | f        | Schema.Literals(["draft", "active", "sold"]) | 
+ rating       | numeric                  | t        | Schema.NullOr(Schema.String)                 | numeric is decoded as a decimal string
+ tags         | text[]                   | f        | Schema.Array(Schema.NullOr(Schema.String))   | 
+ tags[]       | text                     | t        | Schema.NullOr(Schema.String)                 | nullability unknown, assumed nullable
+ published_on | date                     | t        | Schema.NullOr(Schema.String)                 | 
+(13 rows)
+
+SELECT * FROM query_shape($$
+  INSERT INTO users (id, email, created_at) VALUES ($1, $2, now()) RETURNING id, bio, created_at
+$$);
+    path    |         pg_type          | nullable |            schema            | note 
+------------+--------------------------+----------+------------------------------+------
+ $1         | integer                  |          | Schema.Number                | 
+ $2         | text                     |          | Schema.String                | 
+ id         | integer                  | f        | Schema.Number                | 
+ bio        | text                     | t        | Schema.NullOr(Schema.String) | 
+ created_at | timestamp with time zone | f        | Schema.Date                  | 
+(5 rows)
+
+SELECT * FROM query_shape($$ SELECT 1; SELECT 2 $$);
+ERROR:  query_schema expects exactly one statement
+SELECT * FROM query_shape($$ VACUUM $$);
+ERROR:  query_schema only describes SELECT, INSERT, UPDATE, DELETE and MERGE
+SELECT * FROM query_shape($$
+  SELECT
+    CASE WHEN l.id IS NULL THEN NULL ELSE json_build_object('id', l.id, 'title', l.title, 'soldAt', l.sold_at) END AS listing,
+    CASE WHEN l.id IS NOT NULL THEN l.title END AS title_when_present
+  FROM users u LEFT JOIN listings l ON l.seller_id = u.id
+$$);
+        path        |             pg_type              | nullable |                                                         schema                                                          | note 
+--------------------+----------------------------------+----------+-------------------------------------------------------------------------------------------------------------------------+------
+ listing            | json object                      | t        | Schema.NullOr(Schema.Struct({ id: Schema.Number, title: Schema.String, soldAt: Schema.NullOr(Schema.DateFromString) })) | 
+ listing.id         | integer in json                  | f        | Schema.Number                                                                                                           | 
+ listing.title      | text in json                     | f        | Schema.String                                                                                                           | 
+ listing.soldAt     | timestamp with time zone in json | t        | Schema.NullOr(Schema.DateFromString)                                                                                    | 
+ title_when_present | text                             | t        | Schema.NullOr(Schema.String)                                                                                            | 
+(5 rows)
+
