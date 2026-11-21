@@ -94,3 +94,41 @@ SELECT * FROM query_shape($$
     CASE WHEN l.id IS NOT NULL THEN l.title END AS title_when_present
   FROM users u LEFT JOIN listings l ON l.seller_id = u.id
 $$);
+
+CREATE TYPE money_pair AS (amount bigint, label text);
+CREATE TABLE ledger (id int PRIMARY KEY, amounts bigint[] NOT NULL, grid int[][], pair money_pair, cash money, doc tsvector);
+
+SELECT query_schema($$
+  SELECT u.id, p.listings, c.n, x.one
+  FROM users u
+  LEFT JOIN LATERAL (SELECT coalesce(json_agg(json_build_object('id', l.id, 'priceKobo', l.price_kobo)), '[]') AS listings FROM listings l WHERE l.seller_id = u.id) p ON true
+  LEFT JOIN LATERAL (SELECT count(*) AS n FROM listings l WHERE l.seller_id = u.id) c ON true
+  LEFT JOIN LATERAL (SELECT 1 AS one) x ON true
+$$);
+
+SELECT * FROM query_shape($$
+  SELECT u.id, p.n, t.title
+  FROM users u
+  LEFT JOIN LATERAL (SELECT count(*) AS n FROM listings l WHERE l.seller_id = u.id) p ON p.n > 0
+  LEFT JOIN LATERAL (SELECT title FROM listings l WHERE l.seller_id = u.id LIMIT 1) t ON true
+$$);
+
+SELECT * FROM query_shape($$
+  SELECT json_build_object('amounts', l.amounts, 'grid', l.grid, 'pair', l.pair, 'count', count(*) OVER ()) AS j FROM ledger l
+$$);
+
+SELECT * FROM query_shape($$ SELECT l.amounts, l.grid, l.pair, l.cash, l.doc, (l.id, l.cash) AS r FROM ledger l $$);
+
+SELECT query_schema($$ SELECT l.cash, l.pair FROM ledger l $$);
+
+SELECT * FROM query_shape($$
+  SELECT email::text AS v FROM users UNION ALL SELECT bio FROM users
+$$);
+
+SELECT * FROM query_shape($$
+  SELECT email::text AS v FROM users INTERSECT SELECT bio FROM users
+$$);
+
+SELECT * FROM query_shape($$
+  SELECT bio IS DISTINCT FROM 'x' AS d, g, n FROM users, generate_series(1, 2) WITH ORDINALITY AS s(g, n)
+$$);

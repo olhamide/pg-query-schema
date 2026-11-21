@@ -92,6 +92,8 @@ copy_shape(Shape *shape)
 }
 
 static Shape *typed_shape(Oid type, bool nullable);
+static Shape *typed_shape_dims(Oid type, bool nullable, int dims);
+static Shape *relation_row(Oid relid, Oid rowtype);
 
 static Shape *
 guessed_shape(Oid type)
@@ -108,20 +110,44 @@ is_json_type(Oid type)
 	return type == JSONOID || type == JSONBOID;
 }
 
-static Shape *
-typed_shape(Oid type, bool nullable)
+static bool
+is_composite_type(Oid base)
 {
-	Oid			element = OidIsValid(type) ? get_element_type(getBaseType(type)) : InvalidOid;
+	return OidIsValid(base) && base != RECORDOID && get_typtype(base) == TYPTYPE_COMPOSITE;
+}
+
+static Shape *
+typed_shape_dims(Oid type, bool nullable, int dims)
+{
+	Oid			base = OidIsValid(type) ? getBaseType(type) : InvalidOid;
+	Oid			element = OidIsValid(base) ? get_element_type(base) : InvalidOid;
 	Shape	   *shape;
 
 	if (OidIsValid(element))
 	{
 		shape = make_shape(SHAPE_ARRAY, type, nullable);
-		shape->element = make_shape(is_json_type(element) ? SHAPE_UNKNOWN_JSON : SHAPE_SCALAR, element, true);
-		shape->element->guessed = true;
+		if (dims > 1)
+			shape->element = typed_shape_dims(type, false, dims - 1);
+		else
+		{
+			shape->element = typed_shape_dims(element, true, 1);
+			shape->element->guessed = true;
+		}
+		return shape;
+	}
+	if (is_composite_type(base))
+	{
+		shape = relation_row(get_typ_typrelid(base), type);
+		shape->nullable = nullable;
 		return shape;
 	}
 	return make_shape(is_json_type(type) ? SHAPE_UNKNOWN_JSON : SHAPE_SCALAR, type, nullable);
+}
+
+static Shape *
+typed_shape(Oid type, bool nullable)
+{
+	return typed_shape_dims(type, nullable, 1);
 }
 
 static bool
@@ -173,6 +199,15 @@ static const char *const nonnull_functions[] = {
 static const char *const constant_functions[] = {
 	"now", "statement_timestamp", "clock_timestamp", "transaction_timestamp",
 	"gen_random_uuid", "uuidv4", "uuidv7", "random", "pi", "concat", "format", NULL
+};
+
+static const char *const nonnull_set_functions[] = {
+	"generate_series", "generate_subscripts", NULL
+};
+
+static const char *const text_send_functions[] = {
+	"textsend", "varcharsend", "bpcharsend", "namesend", "charsend", "enum_send", "xml_send",
+	"unknownsend", "cstring_send", "citextsend", NULL
 };
 
 static void
@@ -266,23 +301,25 @@ refined_scope(Scope *scope, Node *quals)
 	return child;
 }
 
-static bool
-attribute_not_null(Oid relid, AttrNumber attno)
+static Shape *
+attribute_shape(Oid relid, AttrNumber attno, Oid type)
 {
 	HeapTuple	tuple;
-	bool		result = false;
+	bool		not_null = false;
+	int			dims = 1;
 
 	if (attno < 0)
-		return true;
+		return typed_shape(type, false);
 	tuple = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(attno));
 	if (HeapTupleIsValid(tuple))
 	{
 		Form_pg_attribute attribute = (Form_pg_attribute) GETSTRUCT(tuple);
 
-		result = attribute->attnotnull && !attribute->attisdropped;
+		not_null = attribute->attnotnull && !attribute->attisdropped;
+		dims = Max(attribute->attndims, 1);
 		ReleaseSysCache(tuple);
 	}
-	return result;
+	return typed_shape_dims(type, !not_null, dims);
 }
 
 static List *
@@ -321,7 +358,7 @@ relation_row(Oid relid, Oid rowtype)
 			Field	   *field = palloc(sizeof(Field));
 
 			field->name = pstrdup(NameStr(attribute->attname));
-			field->shape = typed_shape(attribute->atttypid, !attribute->attnotnull);
+			field->shape = typed_shape_dims(attribute->atttypid, !attribute->attnotnull, Max(attribute->attndims, 1));
 			shape->fields = lappend(shape->fields, field);
 		}
 		ReleaseSysCache(tuple);
@@ -330,12 +367,15 @@ relation_row(Oid relid, Oid rowtype)
 	return shape;
 }
 
+static Shape *shape_target(Scope *inner, Query *query, int index, TargetEntry *entry);
+
 static Shape *
 query_row(Scope *scope, Query *query, Oid rowtype)
 {
 	Scope	   *inner = make_scope(query, scope);
 	Shape	   *shape = make_shape(SHAPE_OBJECT, rowtype, false);
 	ListCell   *lc;
+	int			index = 0;
 
 	foreach(lc, target_entries(query))
 	{
@@ -343,7 +383,7 @@ query_row(Scope *scope, Query *query, Oid rowtype)
 		Field	   *field = palloc(sizeof(Field));
 
 		field->name = pstrdup(entry->resname != NULL ? entry->resname : "?column?");
-		field->shape = shape_expr(inner, (Node *) entry->expr);
+		field->shape = shape_target(inner, query, index++, entry);
 		shape->fields = lappend(shape->fields, field);
 	}
 	return shape;
@@ -376,7 +416,147 @@ shape_column_of_query(Scope *scope, Query *query, AttrNumber attno, Oid type)
 		return guessed_shape(type);
 	entry = list_nth_node(TargetEntry, target_entries(query), attno - 1);
 	inner = make_scope(query, scope);
+	return shape_target(inner, query, attno - 1, entry);
+}
+
+static Shape *merge_shapes(Shape *a, Shape *b, Oid type);
+
+static Shape *
+shape_setop(Scope *scope, Query *query, Node *node, int index, Oid type)
+{
+	if (IsA(node, RangeTblRef))
+	{
+		RangeTblEntry *rte = rt_fetch(((RangeTblRef *) node)->rtindex, query->rtable);
+
+		if (rte->rtekind != RTE_SUBQUERY)
+			return guessed_shape(type);
+		return shape_column_of_query(scope, rte->subquery, index + 1, type);
+	}
+	if (IsA(node, SetOperationStmt))
+	{
+		SetOperationStmt *setop = (SetOperationStmt *) node;
+		Shape	   *left = shape_setop(scope, query, setop->larg, index, type);
+		Shape	   *right;
+		Shape	   *merged;
+
+		if (setop->op == SETOP_EXCEPT)
+			return left;
+		right = shape_setop(scope, query, setop->rarg, index, type);
+		merged = merge_shapes(left, right, type);
+		if (setop->op == SETOP_INTERSECT)
+		{
+			merged = copy_shape(merged);
+			merged->nullable = left->nullable && right->nullable;
+			merged->guessed = merged->nullable && (left->guessed || right->guessed);
+		}
+		return merged;
+	}
+	return guessed_shape(type);
+}
+
+static Shape *
+shape_target(Scope *inner, Query *query, int index, TargetEntry *entry)
+{
+	if (query->setOperations != NULL)
+		return shape_setop(inner, query, query->setOperations, index, exprType((Node *) entry->expr));
 	return shape_expr(inner, (Node *) entry->expr);
+}
+
+static bool
+always_one_row(Query *query)
+{
+	if (query == NULL || query->commandType != CMD_SELECT || query->setOperations != NULL ||
+		query->hasTargetSRFs || query->havingQual != NULL || query->limitCount != NULL ||
+		query->limitOffset != NULL || query->groupClause != NIL || query->groupingSets != NIL)
+		return false;
+	if (query->hasAggs)
+		return true;
+	return query->jointree != NULL && query->jointree->fromlist == NIL && query->jointree->quals == NULL;
+}
+
+static JoinExpr *
+find_join(Node *node, int rtindex)
+{
+	ListCell   *lc;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, FromExpr))
+	{
+		foreach(lc, ((FromExpr *) node)->fromlist)
+		{
+			JoinExpr   *found = find_join(lfirst(lc), rtindex);
+
+			if (found != NULL)
+				return found;
+		}
+		return NULL;
+	}
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *join = (JoinExpr *) node;
+		JoinExpr   *found;
+
+		if (join->rtindex == rtindex)
+			return join;
+		found = find_join(join->larg, rtindex);
+		return found != NULL ? found : find_join(join->rarg, rtindex);
+	}
+	return NULL;
+}
+
+static bool
+quals_always_true(Node *quals)
+{
+	List	   *conjuncts = NIL;
+	ListCell   *lc;
+
+	collect_conjuncts(quals, &conjuncts);
+	foreach(lc, conjuncts)
+	{
+		Node	   *qual = lfirst(lc);
+
+		if (!IsA(qual, Const) || ((Const *) qual)->constisnull || ((Const *) qual)->consttype != BOOLOID ||
+			!DatumGetBool(((Const *) qual)->constvalue))
+			return false;
+	}
+	return true;
+}
+
+static bool
+never_null_extended(Query *query, Var *var)
+{
+	RangeTblEntry *rte = rt_fetch(var->varno, query->rtable);
+	int			member = -1;
+
+	if (rte->rtekind != RTE_SUBQUERY || !always_one_row(rte->subquery))
+		return false;
+	while ((member = bms_next_member(var->varnullingrels, member)) >= 0)
+	{
+		JoinExpr   *join = find_join((Node *) query->jointree, member);
+
+		if (join == NULL || join->jointype != JOIN_LEFT || !IsA(join->rarg, RangeTblRef) ||
+			((RangeTblRef *) join->rarg)->rtindex != var->varno || !quals_always_true(join->quals))
+			return false;
+	}
+	return true;
+}
+
+static bool
+nonnull_set_function(RangeTblEntry *rte, AttrNumber attno)
+{
+	RangeTblFunction *function;
+	Node	   *expr;
+	char	   *name;
+
+	if (rte->rtekind != RTE_FUNCTION || list_length(rte->functions) != 1 || attno != 1)
+		return false;
+	function = linitial_node(RangeTblFunction, rte->functions);
+	expr = function->funcexpr;
+	if (expr == NULL || !IsA(expr, FuncExpr))
+		return false;
+	name = get_func_name(((FuncExpr *) expr)->funcid);
+	return name != NULL && name_in(name, nonnull_set_functions);
 }
 
 static Shape *
@@ -413,7 +593,13 @@ shape_var(Scope *scope, Var *var)
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
-				base = typed_shape(var->vartype, !attribute_not_null(rte->relid, var->varattno));
+				base = attribute_shape(rte->relid, var->varattno, var->vartype);
+				break;
+			case RTE_FUNCTION:
+				base = nonnull_set_function(rte, var->varattno) ||
+					(rte->funcordinality && var->varattno == list_length(rte->eref->colnames))
+					? typed_shape(var->vartype, false)
+					: guessed_shape(var->vartype);
 				break;
 			case RTE_SUBQUERY:
 				base = shape_column_of_query(level, rte->subquery, var->varattno, var->vartype);
@@ -463,7 +649,8 @@ shape_var(Scope *scope, Var *var)
 		result->guessed = false;
 		return result;
 	}
-	null_extended = !bms_is_empty(var->varnullingrels) && !bms_is_member(var->varno, level->present);
+	null_extended = !bms_is_empty(var->varnullingrels) && !bms_is_member(var->varno, level->present) &&
+		!never_null_extended(level->query, var);
 	result->nullable = result->nullable || null_extended;
 	return result;
 }
@@ -654,7 +841,7 @@ shape_func(Scope *scope, FuncExpr *func)
 		shape->nullable = arg->nullable;
 		return shape;
 	}
-	if (name_in(name, constant_functions))
+	if (name_in(name, constant_functions) || name_in(name, nonnull_set_functions))
 		return typed_shape(type, false);
 	if (strcmp(name, "concat_ws") == 0)
 	{
@@ -758,14 +945,6 @@ shape_agg(Scope *scope, Aggref *agg)
 	return guessed_shape(agg->aggtype);
 }
 
-static bool
-single_row(Query *query)
-{
-	return query->hasAggs && query->groupClause == NIL && query->groupingSets == NIL &&
-		query->havingQual == NULL && query->limitCount == NULL && query->limitOffset == NULL &&
-		query->setOperations == NULL && !query->hasTargetSRFs;
-}
-
 static Shape *
 shape_sublink(Scope *scope, SubLink *sublink)
 {
@@ -792,7 +971,7 @@ shape_sublink(Scope *scope, SubLink *sublink)
 		return shape;
 	}
 	shape = copy_shape(value);
-	shape->nullable = value->nullable || !single_row(query);
+	shape->nullable = value->nullable || !always_one_row(query);
 	return shape;
 }
 
@@ -995,6 +1174,7 @@ shape_expr(Scope *scope, Node *node)
 			}
 		case T_NullTest:
 		case T_BooleanTest:
+		case T_DistinctExpr:
 			return make_shape(SHAPE_SCALAR, BOOLOID, false);
 		case T_NullIfExpr:
 			return make_shape(SHAPE_SCALAR, ((NullIfExpr *) node)->opresulttype, true);
@@ -1130,7 +1310,7 @@ append_scalar(StringInfo out, Shape *shape, bool in_json, char **note)
 
 	if (append_enum(out, type))
 		return;
-	if (type == TEXTOID && shape->cast_from == INT8OID)
+	if (type == TEXTOID && OidIsValid(shape->cast_from) && getBaseType(shape->cast_from) == INT8OID)
 	{
 		appendStringInfoString(out, "Schema.BigIntFromString");
 		return;
@@ -1149,6 +1329,9 @@ append_scalar(StringInfo out, Shape *shape, bool in_json, char **note)
 				appendStringInfoString(out, "Schema.Boolean");
 				return;
 			case INT8OID:
+				appendStringInfoString(out, "Schema.Int.pipe(Schema.decodeTo(Schema.BigInt, { decode: SchemaGetter.BigInt(), encode: SchemaGetter.Number() }))");
+				add_note(note, "JSON number decoded to a bigint, values beyond 2^53 fail to decode, cast to ::text for the full range");
+				return;
 			case NUMERICOID:
 				appendStringInfoString(out, "Schema.Number");
 				add_note(note, "JSON number can lose precision, cast to ::text");
@@ -1198,13 +1381,81 @@ append_scalar(StringInfo out, Shape *shape, bool in_json, char **note)
 			appendStringInfoString(out, "Schema.String");
 			add_note(note, "numeric is decoded as a decimal string");
 			return;
-		case RECORDOID:
-			appendStringInfoString(out, "Schema.String");
-			add_note(note, "a row value outside JSON is decoded as text");
-			return;
 		default:
 			appendStringInfoString(out, "Schema.String");
 			return;
+	}
+}
+
+static bool
+has_scalar_codec(Oid type)
+{
+	switch (type)
+	{
+		case BOOLOID: case BPCHAROID: case BYTEAOID: case CIDROID: case DATEOID: case FLOAT4OID:
+		case FLOAT8OID: case INETOID: case INT2OID: case INT4OID: case INT8OID: case INTERVALOID:
+		case JSONOID: case JSONBOID: case NAMEOID: case NUMERICOID: case OIDOID: case REGCLASSOID:
+		case TEXTOID: case TIMEOID: case TIMESTAMPOID: case TIMESTAMPTZOID: case TIMETZOID:
+		case UUIDOID: case VARCHAROID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+binary_output_is_text(Oid type)
+{
+	HeapTuple	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	Oid			send = InvalidOid;
+	char	   *name;
+
+	if (HeapTupleIsValid(tuple))
+	{
+		send = ((Form_pg_type) GETSTRUCT(tuple))->typsend;
+		ReleaseSysCache(tuple);
+	}
+	if (!OidIsValid(send))
+		return false;
+	name = get_func_name(send);
+	return name != NULL && name_in(name, text_send_functions);
+}
+
+static bool
+driver_decodes_scalar(Oid type)
+{
+	Oid			base = getBaseType(type);
+
+	return has_scalar_codec(base) || get_typtype(base) == TYPTYPE_ENUM || binary_output_is_text(base);
+}
+
+static char *
+undecodable_reason(Shape *shape, bool in_json)
+{
+	Oid			element;
+
+	if (in_json || shape->json || !OidIsValid(shape->type))
+		return NULL;
+	switch (shape->kind)
+	{
+		case SHAPE_OBJECT:
+			return psprintf("@effect/sql-pg cannot decode %s, select it as ::text or wrap it in to_json",
+							format_type_be(shape->type));
+		case SHAPE_ARRAY:
+			if (shape->element != NULL && shape->element->kind == SHAPE_ARRAY)
+				return pstrdup("@effect/sql-pg cannot decode multidimensional arrays, select it as ::text or wrap it in to_json");
+			element = get_element_type(getBaseType(shape->type));
+			if (OidIsValid(element) && !has_array_codec(element))
+				return psprintf("@effect/sql-pg cannot decode %s, select it as ::text or wrap it in to_json",
+								format_type_be(shape->type));
+			return NULL;
+		case SHAPE_SCALAR:
+			if (!driver_decodes_scalar(shape->type))
+				return psprintf("@effect/sql-pg cannot decode %s, select it as ::text",
+								format_type_be(shape->type));
+			return NULL;
+		default:
+			return NULL;
 	}
 }
 
@@ -1234,14 +1485,16 @@ append_schema(StringInfo out, Shape *shape, bool in_json, int depth, bool pretty
 
 	if (shape->nullable)
 		appendStringInfoString(out, "Schema.NullOr(");
+	if (shape->kind != SHAPE_SCALAR && undecodable_reason(shape, in_json) != NULL)
+	{
+		appendStringInfoString(out, "Schema.String");
+		if (shape->nullable)
+			appendStringInfoChar(out, ')');
+		return;
+	}
 	switch (shape->kind)
 	{
 		case SHAPE_OBJECT:
-			if (!child_json)
-			{
-				appendStringInfoString(out, "Schema.String");
-				break;
-			}
 			if (shape->fields == NIL)
 			{
 				appendStringInfoString(out, "Schema.Struct({})");
@@ -1282,11 +1535,6 @@ append_schema(StringInfo out, Shape *shape, bool in_json, int depth, bool pretty
 			appendStringInfoString(out, "})");
 			break;
 		case SHAPE_ARRAY:
-			if (!child_json && !has_array_codec(get_element_type(getBaseType(shape->type))))
-			{
-				appendStringInfoString(out, "Schema.String");
-				break;
-			}
 			appendStringInfoString(out, "Schema.Array(");
 			if (shape->element == NULL)
 				appendStringInfoString(out, "Schema.Never");
@@ -1328,6 +1576,7 @@ collect_rows(List **rows, const char *path, Shape *shape, bool in_json)
 	Row		   *row = palloc0(sizeof(Row));
 	StringInfoData schema;
 	bool		child_json = in_json || shape->json || is_json_type(shape->type);
+	char	   *reason;
 
 	initStringInfo(&schema);
 	append_schema(&schema, shape, in_json, 0, false);
@@ -1342,9 +1591,14 @@ collect_rows(List **rows, const char *path, Shape *shape, bool in_json)
 		initStringInfo(&ignored);
 		append_scalar(&ignored, shape, in_json || shape->json, &row->note);
 	}
+	reason = undecodable_reason(shape, in_json);
+	if (reason != NULL)
+		add_note(&row->note, reason);
 	if (shape->guessed)
 		add_note(&row->note, "nullability unknown, assumed nullable");
 	*rows = lappend(*rows, row);
+	if (reason != NULL)
+		return;
 
 	if (shape->kind == SHAPE_OBJECT && child_json)
 	{
@@ -1395,6 +1649,7 @@ describe_row(Query *query)
 	Scope	   *scope = make_scope(query, NULL);
 	Shape	   *row = make_shape(SHAPE_OBJECT, RECORDOID, false);
 	ListCell   *lc;
+	int			index = 0;
 
 	foreach(lc, target_entries(query))
 	{
@@ -1402,7 +1657,7 @@ describe_row(Query *query)
 		Field	   *field = palloc(sizeof(Field));
 
 		field->name = pstrdup(entry->resname != NULL ? entry->resname : "?column?");
-		field->shape = shape_expr(scope, (Node *) entry->expr);
+		field->shape = shape_target(scope, query, index++, entry);
 		row->fields = lappend(row->fields, field);
 	}
 	return row;
@@ -1425,6 +1680,11 @@ query_schema(PG_FUNCTION_ARGS)
 	foreach(lc, row->fields)
 	{
 		Field	   *field = lfirst(lc);
+		char	   *reason = undecodable_reason(field->shape, false);
+
+		if (reason != NULL)
+			ereport(WARNING,
+					(errmsg("column \"%s\": %s", field->name, reason)));
 
 		appendStringInfoString(&out, "\n  ");
 		if (valid_identifier(field->name))

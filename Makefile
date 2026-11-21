@@ -1,5 +1,5 @@
 EXTENSION = query_schema
-DATA = sql/query_schema--1.0.sql
+DATA = sql/query_schema--1.1.sql sql/query_schema--1.0--1.1.sql
 MODULE_big = query_schema
 OBJS = src/query-schema.o
 REGRESS = query-schema
