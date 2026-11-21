@@ -17,4 +17,4 @@ RUN initdb -D /tmp/pgdata >/dev/null \
 
 FROM scratch AS package
 COPY --from=build /usr/local/lib/postgresql/query_schema.so /usr/local/lib/postgresql/
-COPY --from=build /usr/local/share/postgresql/extension/query_schema.control /usr/local/share/postgresql/extension/query_schema--1.0.sql /usr/local/share/postgresql/extension/
+COPY --from=build /usr/local/share/postgresql/extension/query_schema.control /usr/local/share/postgresql/extension/query_schema--1.1.sql /usr/local/share/postgresql/extension/query_schema--1.0--1.1.sql /usr/local/share/postgresql/extension/
